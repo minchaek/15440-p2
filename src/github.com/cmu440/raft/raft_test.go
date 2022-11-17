@@ -1,15 +1,19 @@
 package raft
 
-import "github.com/cmu440/rpc"
-import "log"
-import "sync"
-import "testing"
-import "runtime"
-import crand "crypto/rand"
-import "encoding/base64"
-import "sync/atomic"
-import "time"
-import "fmt"
+import (
+	"log"
+	"runtime"
+	"sync"
+	"testing"
+
+	"github.com/cmu440/rpc"
+
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"sync/atomic"
+	"time"
+)
 
 //
 // Raft tests.
@@ -276,6 +280,256 @@ loop:
 	if !success {
 		t.Fatalf("Term changed too often")
 	}
+
+	fmt.Printf("======================= END =======================\n\n")
+}
+
+func TestMyLargePartitionNoConsensusHidden2A(t *testing.T) {
+	fmt.Printf("==================== 11 SERVERS ====================\n")
+	servers := 11
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Hidden Test (2A): partitioned leaders without consensus\n")
+	fmt.Printf("Basic 1 leader\n")
+	leader1 := cfg.checkOneLeader()
+
+	// create a majority partition with leader
+	fmt.Printf("Forming partition2 with leader and 6 nodes\n")
+	partition2 := make(IntSet)
+	partition2[leader1] = struct{}{}
+	i := 0
+	node := 0
+	for i < 6 {
+		if node == leader1 {
+			node++
+			continue
+		}
+		partition2[node] = struct{}{}
+		node++
+		i++
+	}
+	cfg.disconnect_partition(partition2)
+
+	// no leader should be elected in original partition
+	fmt.Printf("Checking for a new leader in original partition\n")
+	partition1 := make(IntSet)
+	for node < servers {
+		if node == leader1 {
+			node++
+			continue
+		}
+		partition1[node] = struct{}{}
+		node++
+	}
+	cfg.checkNoLeaderInPartition(partition1)
+
+	// wait
+	fmt.Printf("Waiting a bit\n")
+	time.Sleep(RaftElectionTimeout)
+
+	// partition2 leader should be the same
+	fmt.Printf("Checking for previous leader in partition2\n")
+	nextLeader := cfg.checkLeaderInPartition(partition2)
+	if nextLeader != leader1 {
+		cfg.t.Fatalf("partition2 has a new leader!\n")
+	}
+
+	// reconnect partition2
+	fmt.Printf("Reconnecting partition2\n")
+	cfg.connect_partition(partition2)
+
+	// wait
+	fmt.Printf("Waiting a bit\n")
+	time.Sleep(RaftElectionTimeout)
+
+	// check for one leader
+	fmt.Printf("Checking for leader\n")
+	cfg.checkOneLeader()
+
+	fmt.Printf("======================= END =======================\n\n")
+}
+
+func TestMyRejoinHidden2B(t *testing.T) {
+	fmt.Printf("==================== 5 SERVERS ====================\n")
+	servers := 5
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Hidden Test (2B): rejoin of partitioned leader\n")
+
+	fmt.Printf("Checking agreement\n")
+	cfg.one(100, servers)
+
+	// disconnect leader
+	fmt.Printf("Disconnecting leader\n")
+	leader := cfg.checkOneLeader()
+	cfg.disconnect(leader)
+
+	// send commands to disconnected leader
+	fmt.Printf("Sending 3 commands to disconnected leader\n")
+	for i := 1; i <= 3; i++ {
+		index, _, ok := cfg.rafts[leader].PutCommand(100 + i)
+		if !ok {
+			t.Fatalf("Leader rejected PutCommand()")
+		}
+		if index != i+1 {
+			t.Fatalf("Expected index %v, got %v", i+1, index)
+		}
+	}
+
+	time.Sleep(2 * RaftElectionTimeout)
+
+	fmt.Printf("Checking agreement for new leader\n")
+	newLeader := cfg.checkOneLeader()
+
+	// disconnect new leader
+	fmt.Printf("Disconnecting new leader\n")
+	cfg.disconnect(newLeader)
+
+	// reconnect first leader
+	fmt.Printf("Connecting first disconnected leader\n")
+	cfg.connect(leader)
+
+	fmt.Printf("Checking agreement\n")
+	cfg.one(104, servers-1)
+
+	// reconnect second leader
+	fmt.Printf("Connecting second disconnected leader\n")
+	cfg.connect(newLeader)
+
+	fmt.Printf("Checking agreement\n")
+	cfg.one(105, servers)
+
+	fmt.Printf("======================= END =======================\n\n")
+}
+
+func TestMyBackupHidden2B(t *testing.T) {
+	fmt.Printf("==================== 5 SERVERS ====================\n")
+	servers := 5
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Hidden Test (2B): leader backs up quickly over " +
+		"incorrect follower logs\n")
+
+	fmt.Printf("Checking agreement\n")
+	cfg.one(100, servers)
+
+	// create partition with leader and one follower
+	fmt.Printf("Putting leader and one follower in a partition\n")
+	leader := cfg.checkOneLeader()
+	follower1 := (leader + 1) % servers
+	partition := make(IntSet)
+	partition[leader] = struct{}{}
+	partition[follower1] = struct{}{}
+	cfg.disconnect_partition(partition)
+
+	// send commands to partitioned leader
+	fmt.Printf("Submitting lots of commands to leader + follower " +
+		"partition which should not commit\n")
+	for i := 1; i <= 5; i++ {
+		index, _, ok := cfg.rafts[leader].PutCommand(100 + i)
+		if !ok {
+			t.Fatalf("Leader rejected PutCommand()")
+		}
+		if index != i+1 {
+			t.Fatalf("Expected index %v, got %v", i+1, index)
+		}
+
+		time.Sleep(2 * RaftElectionTimeout)
+
+		n, _ := cfg.nCommitted(index)
+		if n > 0 {
+			t.Fatalf("%v committed but no majority", n)
+		}
+	}
+
+	fmt.Printf("Disconnecting leader and follower\n")
+	cfg.disconnect(leader)
+	cfg.disconnect(follower1)
+
+	fmt.Printf("Connecting all peers except leader and follower\n")
+	time.Sleep(RaftElectionTimeout)
+
+	fmt.Printf("Submitting lots of commands to the new partition " +
+		"which should commit\n")
+	cfg.one(200, servers-2)
+	cfg.one(201, servers-2)
+	cfg.one(202, servers-2)
+	cfg.one(203, servers-2)
+	cfg.one(204, servers-2)
+	newIndex := cfg.one(205, servers-2)
+
+	fmt.Printf("Disconnecting a follower from the current partition\n")
+	newLeader := cfg.checkOneLeader()
+	var follower2 int
+	var follower3 int
+	for i := 1; i < servers; i++ {
+		node := (newLeader + i) % servers
+		if node != leader && node != follower1 && node != newLeader {
+			follower2 = node
+		}
+	}
+	for i := 1; i < servers; i++ {
+		node := (follower2 + i) % servers
+		if node != leader && node != follower1 &&
+			node != newLeader && node != follower2 {
+			follower3 = node
+		}
+	}
+	cfg.disconnect(follower3)
+
+	fmt.Printf("There should be one leader and one follower in this " +
+		"partition\n")
+
+	fmt.Printf("Submitting lots of commands to the new partition " +
+		"which should not commit\n")
+	for i := 1; i <= 5; i++ {
+		index, _, ok := cfg.rafts[newLeader].PutCommand(300 + i)
+		if !ok {
+			t.Fatalf("Leader rejected PutCommand()")
+		}
+		if index != i+newIndex {
+			t.Fatalf("Expected index %v, got %v", i+newIndex, index)
+		}
+
+		time.Sleep(2 * RaftElectionTimeout)
+
+		n, _ := cfg.nCommitted(index)
+		if n > 0 {
+			t.Fatalf("%v committed but no majority", n)
+		}
+	}
+
+	fmt.Printf("Disconnecting everyone\n")
+	cfg.disconnect(newLeader)
+	cfg.disconnect(follower2)
+
+	fmt.Printf("Reconnecting old leader and follower\n")
+	cfg.connect(leader)
+	cfg.connect(follower1)
+	time.Sleep(RaftElectionTimeout)
+
+	fmt.Printf("Reconnecting new leader's disconnected follower\n")
+	cfg.connect(follower2)
+	time.Sleep(RaftElectionTimeout)
+
+	fmt.Printf("Submitting lots of commands to the new partition " +
+		"which should commit\n")
+	cfg.one(400, servers-2)
+	cfg.one(401, servers-2)
+	cfg.one(402, servers-2)
+	cfg.one(403, servers-2)
+	cfg.one(404, servers-2)
+	cfg.one(405, servers-2)
+
+	fmt.Printf("Connecting everyone\n")
+	cfg.connect(newLeader)
+	cfg.connect(follower3)
+
+	fmt.Printf("Checking agreement\n")
+	cfg.one(500, servers)
 
 	fmt.Printf("======================= END =======================\n\n")
 }
